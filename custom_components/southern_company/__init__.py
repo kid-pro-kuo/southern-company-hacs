@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import time
 
+from . import parser_patch  # noqa: F401
+
 from southern_company_api.exceptions import (
     CantReachSouthernCompany,
     InvalidLogin,

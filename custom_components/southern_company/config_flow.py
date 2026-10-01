@@ -6,6 +6,8 @@ from collections.abc import Mapping
 import logging
 from typing import Any
 
+from . import parser_patch  # noqa: F401
+
 from southern_company_api.exceptions import (
     CantReachSouthernCompany,
     EmailValidationRequired,
