@@ -208,7 +208,16 @@ def _jwt_from_response(resp: aiohttp.ClientResponse) -> Optional[str]:
 
 async def patched_get_jwt(self: SouthernCompanyAPI) -> str:
     """Get session JWT supporting new header format."""
-    sc_web_token = await self.get_sc_web_token()
+    get_token = (
+        getattr(self, "_get_sc_web_token", None)
+        or getattr(self, "get_sc_web_token", None)
+        or getattr(self, "_get_southern_jwt_cookie", None)
+    )
+    if get_token is None:
+        raise CantReachSouthernCompany(
+            "No method to obtain ScWebToken on SouthernCompanyAPI object"
+        )
+    sc_web_token = await get_token()
     headers = dict(constants.API_HEADERS)
     headers["ScWebToken"] = sc_web_token
     async with self.session.get(

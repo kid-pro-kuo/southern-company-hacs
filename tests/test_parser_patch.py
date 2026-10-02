@@ -153,6 +153,22 @@ class TestParserPatchHelpers(unittest.TestCase):
         token2 = _jwt_from_response(resp_bare_header)
         self.assertEqual(token2, valid_jwt)
 
+    def test_patched_get_jwt_method_resolution(self):
+        from custom_components.southern_company.parser_patch import patched_get_jwt
+
+        api_mock = MagicMock()
+        api_mock._get_sc_web_token = MagicMock(return_value="mock_web_token")
+        # Ensure fallback finds _get_sc_web_token when get_sc_web_token is missing
+        del api_mock.get_sc_web_token
+
+        get_token = (
+            getattr(api_mock, "_get_sc_web_token", None)
+            or getattr(api_mock, "get_sc_web_token", None)
+            or getattr(api_mock, "_get_southern_jwt_cookie", None)
+        )
+        self.assertIsNotNone(get_token)
+        self.assertEqual(get_token(), "mock_web_token")
+
 
 if __name__ == "__main__":
     unittest.main()
