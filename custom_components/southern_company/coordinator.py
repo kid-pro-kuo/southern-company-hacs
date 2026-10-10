@@ -76,7 +76,7 @@ class SouthernCompanyCoordinator(DataUpdateCoordinator):
                 await self._insert_statistics()
                 return account_month_data
         except SouthernCompanyException as ex:
-            raise UpdateFailed("Failed updating jwt token") from ex
+            raise UpdateFailed(f"Failed updating Southern Company data: {ex}") from ex
 
         raise UpdateFailed("No jwt token")
 

@@ -234,15 +234,35 @@ async def patched_get_jwt(self: SouthernCompanyAPI) -> str:
                 "Failed to get JWT: no token in set-cookie, in the "
                 "ScJwtToken/ScSoftAuthJwtToken response headers, or in the body."
             )
+
+    token_changed = getattr(self, "_jwt", None) != token
     self._jwt = token
+    try:
+        import jwt as pyjwt
+
+        jwt_decoded = pyjwt.decode(self._jwt, options={"verify_signature": False})
+        self._jwt_expiry = datetime.datetime.fromtimestamp(jwt_decoded["exp"])
+    except Exception:
+        self._jwt_expiry = datetime.datetime.now() + datetime.timedelta(minutes=55)
+
+    if token_changed:
+        for account in getattr(self, "_accounts", []):
+            invalidate_usage_ids(account)
+
     return token
 
 
 async def patched_get_accounts(self: SouthernCompanyAPI) -> List[Account]:
     """Get all accounts using OCC API Cap endpoint."""
-    if self._jwt is None:
+    if getattr(self, "_jwt", None) is None:
+        if hasattr(self, "jwt"):
+            await self.jwt
+        else:
+            await self.get_jwt()
+
+    if getattr(self, "_jwt", None) is None:
         raise CantReachSouthernCompany(
-            f"Can't get jwt. Expired and not refreshed jwt: {self._jwt}"
+            f"Can't get jwt. Expired and not refreshed jwt: {getattr(self, '_jwt', None)}"
         )
     headers = dict(constants.API_HEADERS)
     headers["Authorization"] = f"Bearer {self._jwt}"
@@ -290,7 +310,11 @@ async def patched_get_accounts(self: SouthernCompanyAPI) -> List[Account]:
             raise CantReachSouthernCompany(
                 f"Error parsing account JSON payload. {account_json}"
             ) from err
-        self.accounts = accounts
+
+        for account in accounts:
+            await account.get_service_point_number(self._jwt)
+
+        self._accounts = accounts
         return accounts
 
 
@@ -309,6 +333,13 @@ def patched_account_init(
 ) -> None:
     _orig_account_init(self, name, primary, number, company, session)
     self.usage_ids = getattr(self, "usage_ids", {})
+    self._usage_jwt: Optional[str] = getattr(self, "_usage_jwt", None)
+
+
+def invalidate_usage_ids(self: Account) -> None:
+    """Invalidate session-scoped usage IDs and cached token."""
+    self.usage_ids = {}
+    self._usage_jwt = None
 
 
 def account_headers(self: Account, jwt: str) -> Dict[str, str]:
@@ -324,6 +355,11 @@ async def patched_get_service_point_number(self: Account, jwt: str) -> str:
             constants.ACCOUNT_SUMMARY_URL.format(account=self.number),
             headers=account_headers(self, jwt),
         ) as resp:
+            if resp.status in (401, 403):
+                invalidate_usage_ids(self)
+                raise CantReachSouthernCompany(
+                    f"Authorization failure fetching account summary: status {resp.status}"
+                )
             if resp.status != 200:
                 raise CantReachSouthernCompany(
                     f"Failed to get account summary: status {resp.status}"
@@ -348,7 +384,7 @@ async def patched_get_service_point_number(self: Account, jwt: str) -> str:
             "No service agreement for account ending %s; monthly/hourly stats unavailable",
             str(self.number)[-4:],
         )
-        self.usage_ids = {}
+        invalidate_usage_ids(self)
         self.service_point_number = ""
         return ""
 
@@ -371,17 +407,21 @@ async def patched_get_service_point_number(self: Account, jwt: str) -> str:
             "Could not resolve usage ids for account ending %s; monthly/hourly stats unavailable",
             str(self.number)[-4:],
         )
-        self.usage_ids = {}
+        invalidate_usage_ids(self)
         self.service_point_number = ""
         return ""
 
     self.usage_ids = ids
     self.service_point_number = str(ids["servicePointId"])
+    self._usage_jwt = jwt
     return self.service_point_number
 
 
 async def _usage_ids(self: Account, jwt: str) -> Dict[str, Any]:
-    if not getattr(self, "usage_ids", {}).get("serviceAgreementId"):
+    cached_jwt = getattr(self, "_usage_jwt", None)
+    cached_ids = getattr(self, "usage_ids", {})
+    if cached_jwt != jwt or not cached_ids.get("serviceAgreementId"):
+        invalidate_usage_ids(self)
         await self.get_service_point_number(jwt)
     if not getattr(self, "usage_ids", {}).get("serviceAgreementId"):
         raise UsageDataFailure(
@@ -427,6 +467,11 @@ async def _usage_graph_data(
         headers=account_headers(self, jwt),
         params=params,
     ) as resp:
+        if resp.status in (401, 403):
+            invalidate_usage_ids(self)
+            raise CantReachSouthernCompany(
+                f"Authorization failure fetching {what}: status {resp.status}"
+            )
         if resp.status != 200:
             raise UsageDataFailure(f"Failed to get {what}: {resp.status}")
         try:
@@ -516,18 +561,38 @@ async def patched_get_month_data(self: Account, jwt: str) -> MonthlyUsage:
     payload = await _usage_graph_data(
         self, jwt, "Daily", first_of_month, today, {"intervalBehavior": "Automatic"}
     )
+    dollars_to_date = first(payload, "dollarsToDate", "DollarsToDate")
+    total_kwh_used = first(payload, "totalkWhUsed", "TotalkWhUsed")
+    if dollars_to_date is None or total_kwh_used is None:
+        raise UsageDataFailure(
+            f"Missing essential monthly summary totals (dollarsToDate/totalkWhUsed) for account ending {str(self.number)[-4:]}"
+        )
     return MonthlyUsage(
-        dollars_to_date=first(payload, "dollarsToDate", default=0),
-        total_kwh_used=first(payload, "totalkWhUsed", default=0),
-        average_daily_usage=first(payload, "averageDailyUsage", default=0),
-        average_daily_cost=first(payload, "averageDailyCost", default=0),
-        projected_usage_low=first(payload, "projectedUsageLow", default=0),
-        projected_usage_high=first(payload, "projectedUsageHigh", default=0),
-        projected_bill_amount_low=first(
-            payload, "projectedBillAmountLow", default=0
+        dollars_to_date=float(dollars_to_date),
+        total_kwh_used=float(total_kwh_used),
+        average_daily_usage=float(
+            first(payload, "averageDailyUsage", "AverageDailyUsage", default=0) or 0
         ),
-        projected_bill_amount_high=first(
-            payload, "projectedBillAmountHigh", default=0
+        average_daily_cost=float(
+            first(payload, "averageDailyCost", "AverageDailyCost", default=0) or 0
+        ),
+        projected_usage_low=float(
+            first(payload, "projectedUsageLow", "ProjectedUsageLow", default=0) or 0
+        ),
+        projected_usage_high=float(
+            first(payload, "projectedUsageHigh", "ProjectedUsageHigh", default=0) or 0
+        ),
+        projected_bill_amount_low=float(
+            first(
+                payload, "projectedBillAmountLow", "ProjectedBillAmountLow", default=0
+            )
+            or 0
+        ),
+        projected_bill_amount_high=float(
+            first(
+                payload, "projectedBillAmountHigh", "ProjectedBillAmountHigh", default=0
+            )
+            or 0
         ),
     )
 
@@ -577,6 +642,8 @@ def apply_patches() -> None:
         Account.get_daily_data = patched_get_daily_data
         Account.get_hourly_data = patched_get_hourly_data
         Account.get_month_data = patched_get_month_data
+        Account.invalidate_usage_ids = invalidate_usage_ids
+        Account._usage_ids = _usage_ids
 
         if isinstance(DailyEnergyUsageList, type):
             DailyEnergyUsageList.usage = patched_daily_usage_list_usage
